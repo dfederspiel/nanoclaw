@@ -26,9 +26,10 @@ export const PROXY_BIND_HOST =
 function detectProxyBindHost(): string {
   if (os.platform() === 'darwin') return '127.0.0.1';
 
-  // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
+  // WSL with Docker Desktop uses the same VM routing as macOS — loopback works.
+  // But WSL with Docker Engine (native) needs the bridge IP, same as bare-metal Linux.
+  // Only use loopback if Docker Desktop is detected (it injects host.docker.internal natively).
   // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
-  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
 
   // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
   const ifaces = os.networkInterfaces();
@@ -59,7 +60,7 @@ export function readonlyMountArgs(
 
 /** Returns the shell command to stop a container by name. */
 export function stopContainer(name: string): string {
-  return `${CONTAINER_RUNTIME_BIN} stop ${name}`;
+  return `${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`;
 }
 
 /** Ensure the container runtime is running, starting it if needed. */
