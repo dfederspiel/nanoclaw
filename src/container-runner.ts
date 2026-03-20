@@ -158,14 +158,62 @@ function buildVolumeMounts(
       fs.cpSync(srcDir, dstDir, { recursive: true });
     }
   }
+
+  const homeDir = os.homedir();
+
+  // Sync host Claude commands (e.g., ghost-write) into the group's .claude/commands/
+  // so container agents can use the same slash commands as the host.
+  // Refreshed on every container launch to maintain single source of truth.
+  const hostCommandsDir = path.join(homeDir, '.claude', 'commands');
+  if (fs.existsSync(hostCommandsDir)) {
+    const commandsDst = path.join(groupSessionsDir, 'commands');
+    fs.mkdirSync(commandsDst, { recursive: true });
+    for (const cmdFile of fs.readdirSync(hostCommandsDir)) {
+      const srcFile = path.join(hostCommandsDir, cmdFile);
+      if (fs.statSync(srcFile).isFile()) {
+        fs.copyFileSync(srcFile, path.join(commandsDst, cmdFile));
+      }
+    }
+  }
+
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
     readonly: false,
   });
 
+  // Git credentials for groups that need to push (e.g., blog).
+  // Mount .gitconfig (read-only) for identity, and forward SSH agent
+  // socket so the container can authenticate without exposing private keys.
+  if (group.folder === 'blog') {
+    const gitconfigPath = path.join(homeDir, '.gitconfig');
+    if (fs.existsSync(gitconfigPath)) {
+      mounts.push({
+        hostPath: gitconfigPath,
+        containerPath: '/home/node/.gitconfig',
+        readonly: true,
+      });
+    }
+    const sshAuthSock = process.env.SSH_AUTH_SOCK;
+    if (sshAuthSock && fs.existsSync(sshAuthSock)) {
+      mounts.push({
+        hostPath: sshAuthSock,
+        containerPath: '/ssh-agent.sock',
+        readonly: false,
+      });
+    }
+    // Mount known_hosts so git can verify github.com
+    const knownHostsPath = path.join(homeDir, '.ssh', 'known_hosts');
+    if (fs.existsSync(knownHostsPath)) {
+      mounts.push({
+        hostPath: knownHostsPath,
+        containerPath: '/home/node/.ssh/known_hosts',
+        readonly: true,
+      });
+    }
+  }
+
   // Gmail credentials directory (for Gmail MCP inside the container)
-  const homeDir = os.homedir();
   const gmailDir = path.join(homeDir, '.gmail-mcp');
   if (fs.existsSync(gmailDir)) {
     mounts.push({
@@ -227,11 +275,18 @@ function buildVolumeMounts(
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  extraEnv?: Record<string, string>,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  if (extraEnv) {
+    for (const [key, value] of Object.entries(extraEnv)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
 
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(
@@ -290,7 +345,17 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+
+  // Pass SSH agent socket path to blog containers for git push
+  const extraEnv: Record<string, string> = {};
+  if (group.folder === 'blog' && process.env.SSH_AUTH_SOCK) {
+    extraEnv.SSH_AUTH_SOCK = '/ssh-agent.sock';
+  }
+  const containerArgs = buildContainerArgs(
+    mounts,
+    containerName,
+    Object.keys(extraEnv).length > 0 ? extraEnv : undefined,
+  );
 
   logger.debug(
     {
